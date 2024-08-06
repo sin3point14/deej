@@ -28,6 +28,7 @@ type SerialIO struct {
 	connected   bool
 	connOptions serial.OpenOptions
 	conn        io.ReadWriteCloser
+	lineChannel chan string
 
 	lastKnownNumSliders        int
 	currentSliderPercentValues []float32
@@ -42,7 +43,7 @@ type SliderMoveEvent struct {
 }
 
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
-var maxRetryDelay = 100 * time.Second
+var delay = 1 * time.Second
 
 // NewSerialIO creates a SerialIO instance that uses the provided deej
 // instance's connection info to establish communications with the arduino chip
@@ -61,13 +62,35 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	logger.Debug("Created serial i/o instance")
 
 	// respond to config changes
-	sio.setupOnConfigReload()
+	sio.setupOnConfigReload(deej.notifier)
 
 	return sio, nil
 }
 
+func (sio *SerialIO) retryConnection(notifier Notifier) {
+	port := sio.connOptions.PortName
+	notifier.Notify("Connection lost", fmt.Sprintf("No serial device found on %s", port))
+	var err error
+	for {
+		sio.logger.Info("Retrying serial connection")
+		sio.conn, err = serial.Open(sio.connOptions)
+		if err == nil {
+			break
+		}
+		sio.logger.Warnw("Failed to open serial connection", "error", err)
+		time.Sleep(delay)
+	}
+	notifier.Notify("Connected", fmt.Sprintf("Serial device found on %s", port))
+}
+
+func (sio *SerialIO) openReader(log *zap.SugaredLogger) {
+	connReader := bufio.NewReader(sio.conn)
+	sio.lineChannel = sio.readLine(log, connReader)
+}
+
 // Start attempts to connect to our arduino chip
-func (sio *SerialIO) Start() error {
+// retries connection if it is dropped while reading
+func (sio *SerialIO) Start(notifier Notifier) error {
 
 	// don't allow multiple concurrent connections
 	if sio.connected {
@@ -97,22 +120,9 @@ func (sio *SerialIO) Start() error {
 		"minReadSize", minimumReadSize)
 
 	var err error
-	delay := 1 * time.Second
-	for i := int64(1); ; i++ {
-		sio.conn, err = serial.Open(sio.connOptions)
-		if err == nil {
-			break
-		}
-		sio.logger.Warnw("Failed to open serial connection", "error", err)
-		time.Sleep(delay)
-		// Exponentially back off retries up to a max
-		if delay < maxRetryDelay {
-			delay = time.Duration(int64(delay) * i)
-		}
-	}
+	sio.conn, err = serial.Open(sio.connOptions)
 
 	if err != nil {
-
 		// might need a user notification here, TBD
 		sio.logger.Warnw("Failed to open serial connection", "error", err)
 		return fmt.Errorf("open serial connection: %w", err)
@@ -125,19 +135,16 @@ func (sio *SerialIO) Start() error {
 
 	// read lines or await a stop
 	go func() {
-		connReader := bufio.NewReader(sio.conn)
-		lineChannel := sio.readLine(namedLogger, connReader)
-
+		sio.openReader(namedLogger)
 		for {
 			select {
 			case <-sio.stopChannel:
 				sio.close(namedLogger)
-			case line, ok := <-lineChannel:
+			case line, ok := <-sio.lineChannel:
 				sio.handleLine(namedLogger, line)
 				if !ok {
-					sio.connected = false
-					sio.Start()
-					return
+					sio.retryConnection(notifier)
+					sio.openReader(namedLogger)
 				}
 			}
 		}
@@ -165,7 +172,7 @@ func (sio *SerialIO) SubscribeToSliderMoveEvents() chan SliderMoveEvent {
 	return ch
 }
 
-func (sio *SerialIO) setupOnConfigReload() {
+func (sio *SerialIO) setupOnConfigReload(notifier Notifier) {
 	configReloadedChannel := sio.deej.config.SubscribeToChanges()
 
 	const stopDelay = 50 * time.Millisecond
@@ -195,7 +202,7 @@ func (sio *SerialIO) setupOnConfigReload() {
 					// let the connection close
 					<-time.After(stopDelay)
 
-					if err := sio.Start(); err != nil {
+					if err := sio.Start(notifier); err != nil {
 						sio.logger.Warnw("Failed to renew connection after parameter change", "error", err)
 					} else {
 						sio.logger.Debug("Renewed connection successfully")
